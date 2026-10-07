@@ -30,6 +30,7 @@ import sys
 from collections import deque
 
 WMAX = 150   # target width of folded sequences
+HOT = 1      # loop bodies may be this many times wider (fewer turns per iteration)
 
 # ---------------------------------------------------------------------------
 # parsing
@@ -168,31 +169,38 @@ def parse_program(text):
                 return out, word
             pos += 1
             try:
-                out.append(stmt(s, word))
+                t = stmt(s, word)
             except SyntaxError as e:
                 raise SyntaxError('line %d: %s' % (n, e))
+            LINENO[id(t)] = n
+            out.append(t)
 
     def stmt(s, word):
         nonlocal pos
         rest = s[len(word):].strip()
-        if word == 'if':
+        if word in ('if', 'ifcold'):
             arms = [cond(rest)]
+            cold = [word == 'ifcold']
             bodies = []
             while True:
-                b, end = body(('elif', 'else', 'end'))
+                b, end = body(('elif', 'elifcold', 'else', 'end'))
                 bodies.append(b)
                 s2 = lines[pos][1]
                 pos += 1
-                if end == 'elif':
-                    arms.append(cond(s2[4:].strip()))
+                if end in ('elif', 'elifcold'):
+                    arms.append(cond(s2[len(end):].strip()))
+                    cold.append(end == 'elifcold')
                     continue
                 els = None
                 if end == 'else':
                     els, _ = body(('end',))
                     pos += 1
                 # elif chains become nested ifs
-                for c, b in reversed(list(zip(arms, bodies))):
+                for c, b, k in reversed(list(zip(arms, bodies, cold))):
                     els = [('if', c, b, els or [])]
+                    LINENO[id(els[0])] = lines[pos - 1][0]
+                    if k:
+                        COLD.add(id(els[0]))
                 return els[0]
         if word == 'while':
             b, _ = body(('end',))
@@ -220,10 +228,20 @@ def parse_program(text):
         n, s = lines[pos]
         pos += 1
         try:
-            out.append(stmt(s, s.split()[0]))
+            t = stmt(s, s.split()[0])
         except SyntaxError as e:
             raise SyntaxError('line %d: %s' % (n, e))
+        LINENO[id(t)] = n
+        out.append(t)
     return out
+
+
+LINENO = {}     # id(statement) -> source line, for the profile map
+COLD = set()    # ids of ifs whose then-arm is rarely taken (ifcold / elifcold)
+
+
+def ends_in_fail(body):
+    return bool(body) and body[-1][0] in ('fail', 'halt')
 
 
 # ---------------------------------------------------------------------------
@@ -461,34 +479,46 @@ def const_binary(k):
 class Tile:
     """A rectangle of cells; the IP enters (0, ey) moving east and leaves (w-1, xy) east."""
 
-    def __init__(self, w, h, ey, xy, cells=None):
+    west = False      # True: the IP leaves (0, xy) moving west instead
+
+    def __init__(self, w, h, ey, xy, cells=None, tags=None):
         self.w, self.h, self.ey, self.xy = w, h, ey, xy
         self.cells = cells if cells is not None else {}
+        self.tags = tags if tags is not None else {}
 
 
-def straight(code):
-    return Tile(len(code), 1, 0, 0, {(i, 0): c for i, c in enumerate(code)})
+def straight(code, tag=0):
+    return Tile(len(code), 1, 0, 0, {(i, 0): c for i, c in enumerate(code)},
+                {(i, 0): tag for i in range(len(code))})
 
 
 class Builder:
     """Places tiles at offsets into one cell map and computes the bounding box."""
 
-    def __init__(self):
+    def __init__(self, tag=0):
         self.cells = {}
+        self.tags = {}
+        self.tag = tag
 
-    def put(self, x, y, c):
+    def put(self, x, y, c, tag=None):
         old = self.cells.get((x, y))
         if old is not None and old != c:
             raise RuntimeError('layout conflict at %r: %r vs %r' % ((x, y), old, c))
         self.cells[(x, y)] = c
+        if tag is not None or (x, y) not in self.tags:
+            self.tags[(x, y)] = self.tag if tag is None else tag
 
     def place(self, t, x, y):
         """Put tile t with its top-left corner at (x, y)."""
         for (i, j), c in t.cells.items():
-            self.put(x + i, y + j, c)
+            self.put(x + i, y + j, c, t.tags.get((i, j)))
         for j in range(t.h):     # reserve the tile's whole box (nops) to catch overlaps
             for i in range(t.w):
                 self.cells.setdefault((x + i, y + j), '.')
+                if (i, j) in t.tags:
+                    self.tags[(x + i, y + j)] = t.tags[(i, j)]
+                else:
+                    self.tags.setdefault((x + i, y + j), self.tag)
 
     def line(self, x0, x1, y, c='.'):
         for x in range(x0, x1 + 1):
@@ -498,32 +528,39 @@ class Builder:
         for y in range(y0, y1 + 1):
             self.put(x, y, c)
 
-    def tile(self, ex, ey, xx, xy):
-        """Normalize: (ex, ey) is the entry cell, (xx, xy) the exit cell."""
+    def tile(self, ex, ey, xx, xy, west=False):
+        """Normalize: (ex, ey) is the entry cell, (xx, xy) the exit cell (left
+        moving west if west)."""
         xs = [p[0] for p in self.cells]
         ys = [p[1] for p in self.cells]
         x0, y0 = min(xs), min(ys)
         assert ex == x0, (ex, x0)
         w = max(xs) - x0 + 1
-        assert xx == max(xs), (xx, max(xs))
+        assert xx == (x0 if west else max(xs)), (xx, max(xs))
         cells = {(x - x0, y - y0): c for (x, y), c in self.cells.items() if c != '.'}
-        return Tile(w, max(ys) - y0 + 1, ey - y0, xy - y0, cells)
+        tags = {(x - x0, y - y0): t for (x, y), t in self.tags.items()}
+        t = Tile(w, max(ys) - y0 + 1, ey - y0, xy - y0, cells, tags)
+        t.west = west
+        return t
 
 
 def rotate(t):
     sw = {'<': '>', '>': '<'}
     cells = {(t.w - 1 - x, t.h - 1 - y): sw.get(c, c) for (x, y), c in t.cells.items()}
-    return Tile(t.w, t.h, t.h - 1 - t.ey, t.h - 1 - t.xy, cells)
+    tags = {(t.w - 1 - x, t.h - 1 - y): g for (x, y), g in t.tags.items()}
+    return Tile(t.w, t.h, t.h - 1 - t.ey, t.h - 1 - t.xy, cells, tags)
 
 
-def if_tile(U, L):
-    """'<' at (0,0): positive -> L (lower), otherwise -> U (upper)."""
-    b = Builder()
+def if_tile(U, L, bottom=False, tag=0):
+    """'<' at (0,0): positive -> L (lower), otherwise -> U (upper). The arms merge at
+    row 0, or (bottom) just above L's exit row, which saves L's climb back."""
+    b = Builder(tag)
     yU = -2 - (U.h - 1) + U.ey       # U's box bottom at row -2
     yL = 2 + L.ey                    # L's box top at row 2
     m = max(2 + U.w, 2 + L.w)
     yUx = yU - U.ey + U.xy
     yLx = yL - L.ey + L.xy
+    yM = yLx - 2 if bottom else 0
     b.put(0, 0, '<')
     b.put(1, -1, '|')
     b.col(1, yU + 1, -2)
@@ -532,32 +569,80 @@ def if_tile(U, L):
     b.line(2 + U.w, m, yUx)
     b.put(m + 1, yUx, '\\')
     b.put(m, yUx + 1, '|')
-    b.col(m, yUx + 2, -1)
-    b.put(m, 0, '>')
-    b.put(m + 1, 0, '.')
+    b.col(m, yUx + 2, yM - 1)
+    b.put(m, yM, '>')
+    b.put(m + 1, yM, '.')
     b.col(0, 1, yL - 1)
     b.put(0, yL, '>')
     b.place(L, 1, yL - L.ey)
     b.line(1 + L.w, m - 2, yLx)
     b.put(m - 1, yLx, '/')
-    b.col(m - 1, 2, yLx - 1)
-    b.put(m - 1, 1, '|')
+    b.col(m - 1, yM + 2, yLx - 1)
+    b.put(m - 1, yM + 1, '|')
     b.line(1, m - 1, 0)
-    return b.tile(0, 0, m + 1, 0)
+    return b.tile(0, 0, m + 1, yM)
 
 
-def while_tile(C, Bd):
+def while_tile_west(C, Bd, tag=0):
+    """Loop whose body ends moving west on its left: the back edge only climbs up
+    the left side. Head '>' at (2,2) merges the entry (from above) and the back
+    edge (from below left); exit to the east on row 1."""
+    b = Builder(tag)
+    b.line(0, 2, 0)
+    b.put(3, 0, '\\')
+    b.put(2, 1, '|')
+    b.put(2, 2, '>')
+    b.place(C, 3, 2)
+    x = 3 + C.w
+    b.put(x, 2, '<')
+    yB = 3 + Bd.ey
+    b.col(x, 3, yB - 1)
+    b.put(x, yB, '>')
+    b.place(Bd, x + 1, 3)
+    yBx = 3 + Bd.xy
+    assert yBx >= 5 and yBx > yB
+    b.line(1, x, yBx)
+    b.put(0, yBx, '\\')
+    b.put(1, yBx - 1, '|')
+    b.col(1, 4, yBx - 2)
+    b.put(1, 3, '|')
+    b.put(x + 1, 1, '>')
+    xe = x + Bd.w
+    b.line(x + 2, xe + 1, 1)
+    return b.tile(0, 0, xe + 1, 1)
+
+
+def while_tile(C, Bd, tag=0):
     """Loop: entry (0,0); condition C (one row) computes T; positive -> body Bd."""
     assert C.h == 1
+    if Bd.west:
+        return while_tile_west(C, Bd, tag)
     if Bd.w == 0:
-        Bd = straight('.')
-    b = Builder()
+        Bd = straight('.', tag)
+    b = Builder(tag)
     b.put(0, 0, '/')
     b.put(0, -1, '|')
     b.put(1, -2, '>')
     b.place(C, 2, -2)
     x = 2 + C.w
     b.put(x, -2, '<')
+    if Bd.h == 1:
+        # a one-row body runs on the way back (row -4, westward), so one turn of
+        # the loop is about twice the longer of condition and body
+        xt = max(x + 2, Bd.w + 2)
+        b.put(x, -1, '>')
+        b.line(x + 1, xt - 1, -1)
+        b.put(xt, -1, '/')
+        b.col(xt, -3, -2)
+        b.put(xt, -4, '<')
+        b.place(rotate(Bd), xt - Bd.w, -4)
+        b.line(2, xt - Bd.w - 1, -4)
+        b.put(1, -4, '/')
+        b.put(1, -3, '.')
+        b.put(x + 1, -3, '>')
+        b.line(x + 2, xt + 1, -3)
+        b.line(x + 1, xt, -2)
+        return b.tile(0, 0, xt + 1, -3)
     yB = -1 + Bd.ey
     yBx = -1 + Bd.xy
     b.col(x, -1, yB - 1)
@@ -594,28 +679,40 @@ def concat(tiles):
     return b.tile(0, first[1], x - 1, y)
 
 
-def fold_seq(tiles):
+def fold_seq(tiles, limit=None, west_ok=False):
+    """Fold a sequence into lines; west_ok: a loop body may end moving west on
+    the left side if the number of lines is even."""
+    limit = limit or WMAX
     tiles = [t for t in tiles if t.w > 0]
     if not tiles:
         return Tile(0, 1, 0, 0)
-    if sum(t.w for t in tiles) <= WMAX:
+    if sum(t.w for t in tiles) <= limit:
         return concat(tiles)
-    lines, cur, cw = [], [], 0
-    for t in tiles:
-        if cur and cw + t.w > WMAX:
-            lines.append(cur)
-            cur, cw = [], 0
-        cur.append(t)
-        cw += t.w
-    lines.append(cur)
+    def split(limit):
+        lines, cur, cw = [], [], 0
+        for t in tiles:
+            if cur and cw + t.w > limit:
+                lines.append(cur)
+                cur, cw = [], 0
+            cur.append(t)
+            cw += t.w
+        lines.append(cur)
+        return lines
+    lines = split(limit)
+    if west_ok:
+        lim = limit
+        while len(lines) % 2 == 1 and lim > 20 and len(lines) < len(tiles):
+            lim = int(lim * 0.95)
+            lines = split(lim)
     lines = [concat(l) for l in lines]
     lines = [l if i % 2 == 0 else rotate(l) for i, l in enumerate(lines)]
-    xr = max(l.w for l in lines) + 2       # column of the right-hand '\'
-    b = Builder()
+    xmax = max(l.w for l in lines) + 2
+    b = Builder(-min([g for t in tiles for g in t.tags.values() if g > 0] or [0]))
     y = 0          # top of the current line
     prev_bottom = None
     prev_exit = None
     entry = None
+    xr = None
     for i, l in enumerate(lines):
         # choose y: below the previous line, and the U-turn needs room
         if prev_bottom is not None:
@@ -633,12 +730,13 @@ def fold_seq(tiles):
                 b.put(0, y + l.ey, '>')
                 b.col(0, prev_exit + 1, y + l.ey - 1)
             ex = y + l.xy
-            b.line(1 + l.w, xr - 1, ex)
             if i + 1 < len(lines):
+                xr = max(l.w, lines[i + 1].w) + 2      # column of this U-turn's '\'
+                b.line(1 + l.w, xr - 1, ex)
                 b.put(xr, ex, '\\')
                 b.put(xr - 1, ex + 1, '|')
             else:
-                b.put(xr, ex, '.')
+                b.line(1 + l.w, xmax, ex)
         else:
             b.place(l, xr - 1 - l.w, y)
             ee = y + l.ey
@@ -648,16 +746,20 @@ def fold_seq(tiles):
             # leave at the left: run to column 1, '/' at column 0
             for xx in range(1, xr - 1 - l.w):
                 b.put(xx, ex, '.')
-            b.put(0, ex, '/')
+            if not (west_ok and i == len(lines) - 1):
+                b.put(0, ex, '/')
         prev_exit = ex
         prev_bottom = y + l.h - 1
+    if len(lines) % 2 == 0 and west_ok:
+        b.put(0, prev_exit, '.')
+        return b.tile(0, entry, 0, prev_exit, west=True)
     if len(lines) % 2 == 0:
         yf = prev_bottom + 1
         b.col(0, prev_exit + 1, yf - 1)
         b.put(0, yf, '>')
-        b.line(1, xr, yf)
-        return b.tile(0, entry, xr, yf)
-    return b.tile(0, entry, xr, prev_exit)
+        b.line(1, xmax, yf)
+        return b.tile(0, entry, xmax, yf)
+    return b.tile(0, entry, xmax, prev_exit)
 
 
 class Gen:
@@ -751,18 +853,32 @@ class Gen:
             m.go_edge(dst)
             m.emit('~')
             return
-        used = []
-        ops = []
-        for x in (a, b):
-            if x[0] == 'bin':
-                t = free.pop(0)
-                used.append(t)
-                self.compile_expr(m, x, self.slots[t], free)
-                ops.append(('reg', t))
+        if op in '+*' and a[0] != 'bin' and b[0] == 'bin':
+            a, b = b, a          # keep the compound operand in the accumulator
+        if op == '*' and a == b:
+            # a square: T is adjacent to both A and B
+            if a[0] == 'bin':
+                self.compile_expr(m, a, T, free)
             else:
-                ops.append(x)
-        m.operand(ops[0], A)
-        m.operand(ops[1], B, avoid=(A,))
+                m.operand(a, T)
+            m.transfer(T, A)
+            m.transfer(T, B, avoid=(A,))
+            m.go_edge(T, ALU)
+            m.emit('*')
+            m.transfer(T, dst)
+            return
+        used = []
+        tb = None
+        if b[0] == 'bin':
+            tb = free.pop(0)
+            used.append(tb)
+            self.compile_expr(m, b, self.slots[tb], free)
+        if a[0] == 'bin':
+            self.compile_expr(m, a, T, free)
+            m.transfer(T, A)
+        else:
+            m.operand(a, A)
+        m.operand(('reg', tb) if tb else b, B, avoid=(A,))
         m.go_edge(T, ALU)
         m.emit(':' if op == '/' else op)
         m.transfer(T, dst)
@@ -802,8 +918,8 @@ class Gen:
         else:
             raise RuntimeError(k)
 
-    def cond_code(self, c):
-        """Returns (code, then_is_positive)."""
+    def cond_code(self, c, flip=False):
+        """Returns (code, then_is_positive); flip computes 1 - T instead of T."""
         op, a, b = c
         if op in ('<', '<='):
             a, b = b, a
@@ -812,11 +928,11 @@ class Gen:
         temps = ['_t%d' % i for i in range(self.ntemps)]
         m = self.mem()
         if op == '>':
-            self.compile_expr(m, d, T, temps)
-            pos = True
+            self.compile_expr(m, fold('-', ('num', 1), d) if flip else d, T, temps)
+            pos = not flip
         elif op == '>=':
-            self.compile_expr(m, fold('+', d, ('num', 1)), T, temps)
-            pos = True
+            self.compile_expr(m, fold('-', ('num', 0), d) if flip else fold('+', d, ('num', 1)), T, temps)
+            pos = not flip
         else:
             if d[0] == 'reg':
                 sq = ('bin', '*', d, d)
@@ -826,19 +942,26 @@ class Gen:
                 self.compile_expr(m, d, self.slots[t], temps)
                 self.compile_expr(m, ('bin', '*', ('reg', t), ('reg', t)), T, temps)
             pos = (op == '!=')
+            if flip:
+                m.transfer(T, B)
+                m.go_edge(A)
+                m.const_here(1, avoid=(B,))
+                m.go_edge(T, ALU)
+                m.emit('-')
+                pos = not pos
         m.go_home()
         return ''.join(m.code), pos
 
-    def chunks(self, code):
-        return [straight(code[i:i + WMAX]) for i in range(0, len(code), WMAX)]
+    def chunks(self, code, tag=0):
+        return [straight(code[i:i + WMAX], tag) for i in range(0, len(code), WMAX)]
 
-    def block(self, body):
+    def block(self, body, limit=None, west_ok=False):
         tiles = []
         run = []
 
         def flush():
             if run:
-                tiles.extend(self.chunks(self.straight_code(run)))
+                tiles.extend(self.chunks(self.straight_code(run), LINENO.get(id(run[0]), 0)))
                 run.clear()
         for s in body:
             if s[0] in ('if', 'while'):
@@ -846,17 +969,27 @@ class Gen:
                 code, pos = self.cond_code(s[1])
                 if s[0] == 'if':
                     th, el = self.block(s[2]), self.block(s[3])
+                    # the hot arm goes below (entered near its top, merging just
+                    # below it); the then-arm is hot unless marked cold or failing
+                    then_cold = id(s) in COLD or ends_in_fail(s[2])
+                    want_then_low = not then_cold or ends_in_fail(s[3])
+                    hot = th if want_then_low else el
+                    empty = hot.w == 0
+                    if want_then_low != pos:
+                        code, pos = self.cond_code(s[1], flip=True)
                     U, L = (el, th) if pos else (th, el)
-                    tiles.extend(self.chunks(code))
-                    tiles.append(if_tile(U, L))
+                    tag = LINENO.get(id(s), 0)
+                    tiles.extend(self.chunks(code, tag))
+                    tiles.append(if_tile(U, L, bottom=not empty, tag=tag))
                 else:
                     if not pos:
-                        raise RuntimeError('while needs a > or >= style condition')
-                    tiles.append(while_tile(straight(code), self.block(s[2])))
+                        code, pos = self.cond_code(s[1], flip=True)
+                    tag = LINENO.get(id(s), 0)
+                    tiles.append(while_tile(straight(code, tag), self.block(s[2], HOT * WMAX, True), tag))
             else:
                 run.append(s)
         flush()
-        return fold_seq(tiles)
+        return fold_seq(tiles, limit, west_ok)
 
 
 # ---------------------------------------------------------------------------
@@ -880,13 +1013,20 @@ def to_hexagon(prog):
         r = i - (n - 1)
         qmin, qmax = max(-(n - 1), -(n - 1) - r), min(n - 1, n - 1 - r)
         rows.append(' ' * abs(n - 1 - i) + ' '.join(b.cells.get((q, i), '.') for q in range(qmin, qmax + 1)))
-    return '\n'.join(rows) + '\n', n
+    tagmap = {}
+    for (x, y), t in b.tags.items():
+        tagmap['%d,%d' % (x, y - (n - 1))] = t
+    return '\n'.join(rows) + '\n', n, tagmap
 
 
 def main():
     args = sys.argv[1:]
     global WMAX
-    out = None
+    out = mapfile = None
+    if '-m' in args:
+        k = args.index('-m')
+        mapfile = args[k + 1]
+        del args[k:k + 2]
     if '-w' in args:
         k = args.index('-w')
         WMAX = int(args[k + 1])
@@ -899,7 +1039,11 @@ def main():
     prog = parse_program(src)
     g = Gen(prog)
     tile = g.block(prog)
-    text, n = to_hexagon(tile)
+    text, n, tagmap = to_hexagon(tile)
+    if mapfile:
+        import json
+        with open(mapfile, 'w') as f:
+            json.dump(tagmap, f)
     sys.stderr.write('hexagon side %d, %d cells, %d registers + %d temps\n'
                      % (n, 3 * n * (n - 1) + 1, len(g.slots) - g.ntemps, g.ntemps))
     if out:
