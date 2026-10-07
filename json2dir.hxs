@@ -1,0 +1,435 @@
+# json2dir evaluator, compiled to Hexagony (json2dir.hxg) by hxc.py.
+#
+# Input: the JSON document on stdin (',' gives -1 at the end).
+# Output: a POSIX sh script ending with the line "# json2dir: end"; on invalid input a
+# "json2dir: ..." line and no end marker (the launcher discards the script then).
+#
+# One loop reads one byte per iteration; a state machine (st) parses the document and
+# writes the script while parsing. Byte strings are kept in Hexagony's unbounded
+# integers, 256 per byte, first byte lowest unless noted:
+#   namer  the current name, REVERSED (last byte lowest); npow = 256^nlen
+#   pathr  the current path "/a/b" reversed; ppow = 256^(its length)
+#   sib    the names of all open objects, innermost object first: per object
+#          "/" name "/" name ... "/" (names reversed, newest first), then a 0 byte
+#   q, nq  decoded bytes waiting for the sink (name, kind, or shell word)
+#
+# st: 0 before the root, 1 after "{", 2 after a member value, 3 after ",",
+#     4 after a name, 5 before a value, 6 before an array kind, 7 after the kind,
+#     8 before the payload, 9 after the payload, 10 after the root, 11 in a string
+# sm (string mode): 1 name, 2 file content, 3 array kind, 4 link target, 5 script content
+# ss (string sub-state): 0 plain, 1 after a backslash, 2 in \uXXXX, 3 in a UTF-8
+#     sequence, 4 a high surrogate wants a backslash, 5 ... and then "u"
+
+print "set -eu\n"
+print "_j2d_fail() { printf 'json2dir: cannot create %s\\n' \"$1\" >&2; exit 1; }\n"
+print "_j2d_clear() {\n"
+print "  if [ -L \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n"
+print "  elif [ -d \"$1\" ]; then printf 'json2dir: a directory is in the way: %s\\n' \"$1\" >&2; exit 1\n"
+print "  elif [ -e \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n"
+print "  fi\n"
+print "}\n"
+print "_j2d_dir() {\n"
+print "  if [ -L \"$1\" ] || { [ -e \"$1\" ] && [ ! -d \"$1\" ]; }; then rm -f -- \"$1\" || _j2d_fail \"$1\"; fi\n"
+print "  if [ ! -d \"$1\" ]; then mkdir -- \"$1\" || _j2d_fail \"$1\"; fi\n"
+print "}\n"
+print "# _j2d_file path part...: the content is the parts joined by NUL bytes\n"
+print "_j2d_file() {\n"
+print "  _j2d_clear \"$1\"\n"
+print "  _j2d_path=$1; shift\n"
+print "  {\n"
+print "    printf '%s' \"$1\"; shift\n"
+print "    for _j2d_part in \"$@\"; do printf '\\000%s' \"$_j2d_part\"; done\n"
+print "  } > \"$_j2d_path\" || _j2d_fail \"$_j2d_path\"\n"
+print "}\n"
+print "_j2d_script() { _j2d_file \"$@\"; chmod a+x -- \"$1\" || _j2d_fail \"$1\"; }\n"
+print "_j2d_link() { _j2d_clear \"$1\"; ln -s -- \"$2\" \"$1\" || _j2d_fail \"$1\"; }\n"
+
+st = 0
+depth = 0
+sib = 0
+pathr = 0
+ppow = 1
+hs = 0
+loop = 1
+ch = read
+while loop > 0
+  nq = 0
+  if ch < 0
+    if st == 10
+      print "# json2dir: end\n"
+      halt
+    end
+    if st == 11
+      fail "unterminated string"
+    end
+    fail "unexpected end of the document"
+  elif st == 11
+    if ss == 0
+      if ch == '"'
+        strend = 1
+      elif ch == '\\'
+        ss = 1
+      elif ch < 32
+        fail "invalid character in a string"
+      elif ch < 128
+        q = ch
+        nq = 1
+      else
+        need = 0
+        lo = 128
+        hi = 191
+        if (ch - 194 + 1) * (223 + 1 - ch) > 0
+          need = 1
+        elif (ch - 224 + 1) * (239 + 1 - ch) > 0
+          need = 2
+          if ch == 224
+            lo = 160
+          elif ch == 237
+            hi = 159
+          end
+        elif (ch - 240 + 1) * (244 + 1 - ch) > 0
+          need = 3
+          if ch == 240
+            lo = 144
+          elif ch == 244
+            hi = 143
+          end
+        else
+          fail "invalid UTF-8"
+        end
+        q = ch
+        nq = 1
+        ss = 3
+      end
+    elif ss == 3
+      if (ch - lo + 1) * (hi + 1 - ch) <= 0
+        fail "invalid UTF-8"
+      end
+      q = ch
+      nq = 1
+      lo = 128
+      hi = 191
+      need = need - 1
+      if need == 0
+        ss = 0
+      end
+    elif ss == 1
+      if ch == 'u'
+        ss = 2
+        hc = 4
+        cp = 0
+      else
+        b = 0
+        if ch == '"'
+          b = 34
+        elif ch == '\\'
+          b = 92
+        elif ch == '/'
+          b = 47
+        elif ch == 'b'
+          b = 8
+        elif ch == 'f'
+          b = 12
+        elif ch == 'n'
+          b = 10
+        elif ch == 'r'
+          b = 13
+        elif ch == 't'
+          b = 9
+        else
+          fail "invalid escape in a string"
+        end
+        q = b
+        nq = 1
+        ss = 0
+      end
+    elif ss == 2
+      d = 0
+      if (ch - '0' + 1) * ('9' + 1 - ch) > 0
+        d = ch - '0'
+      elif (ch - 'a' + 1) * ('f' + 1 - ch) > 0
+        d = ch - 'a' + 10
+      elif (ch - 'A' + 1) * ('F' + 1 - ch) > 0
+        d = ch - 'A' + 10
+      else
+        fail "invalid \\u escape"
+      end
+      cp = cp * 16 + d
+      hc = hc - 1
+      if hc == 0
+        ss = 0
+        if hs > 0
+          if (cp - 56320 + 1) * (57343 + 1 - cp) <= 0
+            fail "lone surrogate"
+          end
+          cp = 65536 + (hs - 55296) * 1024 + cp - 56320
+          hs = 0
+          enc = 1
+        elif (cp - 55296 + 1) * (56319 + 1 - cp) > 0
+          hs = cp
+          ss = 4
+        elif (cp - 56320 + 1) * (57343 + 1 - cp) > 0
+          fail "lone surrogate"
+        else
+          enc = 1
+        end
+      end
+    elif ss == 4
+      if ch != '\\'
+        fail "lone surrogate"
+      end
+      ss = 5
+    else
+      if ch != 'u'
+        fail "lone surrogate"
+      end
+      ss = 2
+      hc = 4
+      cp = 0
+    end
+  elif (ch - 32) * (ch - 10) * (ch - 13) * (ch - 9) == 0
+    nq = 0
+  elif st == 5
+    if ch == '{'
+      ph = 1
+      sib = sib * 65536 + 47
+      depth = depth + 1
+      st = 1
+    elif ch == '"'
+      ph = 2
+      sm = 2
+      ss = 0
+      st = 11
+    elif ch == '['
+      st = 6
+    else
+      fail "only objects, strings and [kind, payload] arrays are allowed"
+    end
+  elif st == 2
+    if ch == ','
+      st = 3
+    elif ch == '}'
+      close = 1
+    else
+      fail "expected , or }"
+    end
+  elif st == 4
+    if ch != ':'
+      fail "expected :"
+    end
+    st = 5
+  elif st == 1
+    if ch == '}'
+      close = 1
+    elif ch == '"'
+      namer = 0
+      npow = 1
+      nlen = 0
+      sm = 1
+      ss = 0
+      st = 11
+    else
+      fail "expected a member name"
+    end
+  elif st == 3
+    if ch != '"'
+      fail "expected a member name"
+    end
+    namer = 0
+    npow = 1
+    nlen = 0
+    sm = 1
+    ss = 0
+    st = 11
+  elif st == 0
+    if ch != '{'
+      fail "the root of the document must be an object"
+    end
+    sib = 47
+    depth = 1
+    st = 1
+  elif st == 6
+    if ch != '"'
+      fail "arrays must be [kind, payload] with a string kind"
+    end
+    kind = 0
+    sm = 3
+    ss = 0
+    st = 11
+  elif st == 7
+    if ch != ','
+      fail "arrays must have exactly two elements"
+    end
+    st = 8
+  elif st == 8
+    if ch != '"'
+      fail "the array payload must be a string"
+    end
+    if ak == 1
+      ph = 3
+      sm = 4
+    else
+      ph = 4
+      sm = 5
+    end
+    ss = 0
+    st = 11
+  elif st == 9
+    if ch != ']'
+      fail "arrays must have exactly two elements"
+    end
+    st = 2
+  else
+    fail "trailing data after the document"
+  end
+
+  # a \u escape (or surrogate pair) is complete: its UTF-8 bytes go to the queue
+  if enc > 0
+    enc = 0
+    if cp < 128
+      q = cp
+      nq = 1
+    elif cp < 2048
+      q = 192 + cp / 64 + 256 * (128 + cp % 64)
+      nq = 2
+    elif cp < 65536
+      q = 224 + cp / 4096 + 256 * (128 + cp / 64 % 64) + 65536 * (128 + cp % 64)
+      nq = 3
+    else
+      q = 240 + cp / 262144 + 256 * (128 + cp / 4096 % 64) + 65536 * (128 + cp / 64 % 64) + 16777216 * (128 + cp % 64)
+      nq = 4
+    end
+  end
+
+  # the sink: decoded string bytes
+  while nq > 0
+    b = q % 256
+    q = q / 256
+    nq = nq - 1
+    if sm == 1
+      if b * (b - 47) == 0
+        fail "names must not contain / or NUL"
+      end
+      namer = namer * 256 + b
+      npow = npow * 256
+      nlen = nlen + 1
+    elif sm == 3
+      kind = kind * 256 + b
+    elif b == 39
+      print "'\\''"
+    elif b == 0
+      if sm == 4
+        fail "link targets must not contain NUL"
+      end
+      print "' '"
+    else
+      out b
+    end
+  end
+
+  # the closing quote of a string
+  if strend > 0
+    strend = 0
+    if sm == 1
+      if nlen == 0
+        fail "names must not be empty"
+      end
+      if (namer - 46) * (namer - 11822) == 0
+        fail "names must not be . or .."
+      end
+      w = 47 + 256 * namer + 47 * 256 * npow
+      mm = 65536 * npow
+      t = sib
+      while t % 256 > 0
+        if t % mm == w
+          fail "duplicate name"
+        end
+        t = t / 256
+      end
+      sib = 47 + 256 * (namer + npow * sib)
+      pathr = namer + npow * (47 + 256 * pathr)
+      ppow = ppow * npow * 256
+      st = 4
+    elif sm == 3
+      if kind == 'l' * 16777216 + 'i' * 65536 + 'n' * 256 + 'k'
+        ak = 1
+      elif kind == 's' * 1099511627776 + 'c' * 4294967296 + 'r' * 16777216 + 'i' * 65536 + 'p' * 256 + 't'
+        ak = 2
+      else
+        fail "the array kind must be \"link\" or \"script\""
+      end
+      st = 7
+    else
+      print "'\n"
+      popc = 1
+      st = 9
+      if sm == 2
+        st = 2
+      end
+    end
+  end
+
+  # the start of an entry: command name and the path as one single-quoted word
+  if ph > 0
+    if ph == 1
+      print "_j2d_dir "
+    elif ph == 2
+      print "_j2d_file "
+    elif ph == 3
+      print "_j2d_link "
+    else
+      print "_j2d_script "
+    end
+    p = ppow / 65536
+    x = pathr % (p * 256)
+    print "'"
+    while p > 0
+      b = x / p
+      x = x % p
+      p = p / 256
+      if b == 39
+        print "'\\''"
+      else
+        out b
+      end
+    end
+    if ph == 1
+      print "'\n"
+    else
+      print "' '"
+    end
+    ph = 0
+  end
+
+  # the closing brace of an object
+  if close > 0
+    close = 0
+    t = sib % 256
+    while t > 0
+      sib = sib / 256
+      t = sib % 256
+    end
+    sib = sib / 256
+    depth = depth - 1
+    st = 10
+    if depth > 0
+      popc = 1
+      st = 2
+    end
+  end
+
+  # the end of a member: drop its name from the path
+  if popc > 0
+    popc = 0
+    t = pathr % 256
+    while (t - 47) * (t - 47) > 0
+      pathr = pathr / 256
+      ppow = ppow / 256
+      t = pathr % 256
+    end
+    pathr = pathr / 256
+    ppow = ppow / 256
+  end
+
+  ch = read
+end

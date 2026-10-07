@@ -1,0 +1,45 @@
+#!/bin/sh
+# The Hexagony evaluator (json2dir.hxg, generated from json2dir.hxs by hxc.py) owns UTF-8
+# checking, JSON parsing, validation and shell generation; this launcher only moves bytes
+# and runs the generated script.
+#
+# Hexagony has no stderr and no exit code: on invalid input the evaluator prints a
+# "json2dir: ..." line instead of the end marker, so the script is only run if its last
+# line is the end marker.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: json2dir < file.json' >&2
+  exit 2
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+task_tmp=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/json2dir.XXXXXXXXXX")
+trap 'rm -rf -- "$task_tmp"' 0
+trap 'exit 1' HUP INT TERM
+
+if ! (umask 077; cat > "$task_tmp/input.json"); then
+  printf '%s\n' "json2dir: couldn't read stdin" >&2
+  exit 1
+fi
+
+if ! (
+  umask 077
+  "${JSON2DIR_HEXAGONY:-hexagony}" "$script_dir/json2dir.hxg" \
+    < "$task_tmp/input.json" > "$task_tmp/tree.sh"
+); then
+  printf '%s\n' 'json2dir: the evaluator failed' >&2
+  exit 1
+fi
+
+last=$(tail -n 1 "$task_tmp/tree.sh")
+if [ "$last" != '# json2dir: end' ]; then
+  case $last in
+    'json2dir: '*) printf '%s\n' "$last" >&2 ;;
+    *) printf '%s\n' 'json2dir: the evaluator did not finish' >&2 ;;
+  esac
+  exit 1
+fi
+
+"${JSON2DIR_SHELL:-/bin/sh}" "$task_tmp/tree.sh"
