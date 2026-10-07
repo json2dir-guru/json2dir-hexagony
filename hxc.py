@@ -19,6 +19,9 @@ Pipeline:
        sequences       folded into lines of bounded width, odd lines rotated by 180
                        degrees (Hexagony's mirrors and branches are symmetric under that
                        rotation, with '<' and '>' swapped)
+     The hot arm of an if (the then-arm unless marked ifcold/elifcold or ending in
+     fail) goes below, entered near its top; a loop body folded into an even number
+     of lines ends on its left, so the back edge only climbs the left side.
      Every straight piece of code starts and ends with the MP at home, conditions are
      computed into T, so all merging paths agree on the memory-pointer state.
   4. the parallelogram is embedded in the smallest regular hexagon whose top-left corner

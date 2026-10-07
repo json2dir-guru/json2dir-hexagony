@@ -4,8 +4,10 @@
 # Output: a POSIX sh script ending with the line "# json2dir: end"; on invalid input a
 # "json2dir: ..." line and no end marker (the launcher discards the script then).
 #
-# One loop reads one byte per iteration; a state machine (st) parses the document and
-# writes the script while parsing. Byte strings are kept in Hexagony's unbounded
+# Two inner loops (inside strings: instr = 1, and outside) read one byte per
+# iteration; a state machine (st) parses the document and writes the script while
+# parsing. "ifcold"/"elifcold" mark rarely taken arms (a layout hint for hxc.py).
+# Byte strings are kept in Hexagony's unbounded
 # integers, 256 per byte, first byte lowest unless noted:
 #   namer  the current name, REVERSED (last byte lowest); npow = 256^nlen
 #   pathr  the current path "/a/b" reversed; ppow = 256^(its length)
